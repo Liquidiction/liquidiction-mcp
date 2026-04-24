@@ -14,6 +14,10 @@ import { z } from 'zod';
 
 const API_URL = process.env.HL_API_URL ?? 'https://api.hyperliquid-testnet.xyz';
 
+/** Seconds; override with HL_REQUEST_TIMEOUT_SEC */
+const REQUEST_TIMEOUT_MS =
+  Math.max(5, Number(process.env.HL_REQUEST_TIMEOUT_SEC ?? 30) || 30) * 1000;
+
 // ---------------------------------------------------------------------------
 // HL API helpers
 // ---------------------------------------------------------------------------
@@ -23,8 +27,15 @@ async function hlInfo<T>(body: object): Promise<T> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`HL API error: ${res.status}`);
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    const detail = errText.length > 500 ? `${errText.slice(0, 500)}…` : errText;
+    throw new Error(
+      `HL API error: ${res.status}${detail ? ` — ${detail}` : ''}`,
+    );
+  }
   return res.json() as Promise<T>;
 }
 
@@ -43,6 +54,17 @@ interface QuestionRaw {
   settledNamedOutcomes: number[];
 }
 interface OutcomeMeta { outcomes: OutcomeRaw[]; questions: QuestionRaw[] }
+
+/** Maps each named outcome id to its parent question (O(1) lookup after build). */
+function buildOutcomeToQuestionMap(questions: QuestionRaw[]): Map<number, QuestionRaw> {
+  const m = new Map<number, QuestionRaw>();
+  for (const q of questions) {
+    for (const oid of q.namedOutcomes) {
+      m.set(oid, q);
+    }
+  }
+  return m;
+}
 interface L2Level { px: string; sz: string; n: number }
 interface L2Book { coin: string; levels: [L2Level[], L2Level[]] }
 interface UserFill {
@@ -94,13 +116,13 @@ server.tool(
       questionMap.set(q.question, q);
     }
 
+    const outcomeToQuestion = buildOutcomeToQuestionMap(meta.questions);
+
     const lines: string[] = [];
     // Group outcomes by question
     const grouped = new Map<number | null, OutcomeRaw[]>();
     for (const o of meta.outcomes) {
-      const qId = [...questionMap.entries()].find(([, q]) =>
-        q.namedOutcomes.includes(o.outcome)
-      )?.[0] ?? null;
+      const qId = outcomeToQuestion.get(o.outcome)?.question ?? null;
       if (!grouped.has(qId)) grouped.set(qId, []);
       grouped.get(qId)!.push(o);
     }
@@ -131,7 +153,18 @@ server.tool(
   { outcome_id: z.number().describe('Outcome ID'), side: z.number().min(0).max(1).default(0).describe('Side (0=Yes/first, 1=No/second)') },
   async ({ outcome_id, side }) => {
     const coin = outcomeToCoin(outcome_id, side);
-    const book = await hlInfo<L2Book>({ type: 'l2Book', coin });
+    const book = await hlInfo<L2Book | null>({ type: 'l2Book', coin });
+
+    if (!book?.levels?.[0] || !book.levels[1]) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No order book for ${coin}. Check outcome id, side, and HL_API_URL (invalid or settled markets may return no book).`,
+          },
+        ],
+      };
+    }
 
     const bids = book.levels[0].slice(0, 10);
     const asks = book.levels[1].slice(0, 10);
@@ -256,12 +289,14 @@ server.tool(
       hlInfo<Record<string, string>>({ type: 'allMids' }),
     ]);
 
+    const outcomeToQuestion = buildOutcomeToQuestionMap(meta.questions);
+
     const outcome = meta.outcomes.find(o => o.outcome === outcome_id);
     if (!outcome) {
       return { content: [{ type: 'text', text: `Outcome ${outcome_id} not found.` }] };
     }
 
-    const question = meta.questions.find(q => q.namedOutcomes.includes(outcome_id));
+    const question = outcomeToQuestion.get(outcome_id);
 
     const lines: string[] = [];
     if (question) lines.push(`Question: ${question.name}`);
@@ -291,10 +326,14 @@ server.tool(
     const endTime = Date.now();
     const startTime = endTime - hours * 60 * 60 * 1000;
 
-    const candles = await hlInfo<Candle[]>({
+    const candles = await hlInfo<Candle[] | null>({
       type: 'candleSnapshot',
       req: { coin: coinToAtFormat(coin), interval, startTime, endTime },
     });
+
+    if (!candles?.length) {
+      return { content: [{ type: 'text', text: 'No candle data found.' }] };
+    }
 
     const lines = candles.map(c => {
       const time = new Date(c.t).toISOString().slice(0, 16);
@@ -311,10 +350,21 @@ server.tool(
   'Get recent trades for a prediction market outcome',
   { coin: z.string().describe('Coin identifier, e.g. "#90"') },
   async ({ coin }) => {
-    const trades = await hlInfo<RecentTrade[]>({
+    const trades = await hlInfo<RecentTrade[] | null>({
       type: 'recentTrades',
       coin: coinToAtFormat(coin),
     });
+
+    if (!trades?.length) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `No recent trades for ${coinToAtFormat(coin)}. Check the coin id (e.g. #90) and network (HL_API_URL).`,
+          },
+        ],
+      };
+    }
 
     const outcomeTrades = trades.filter(t => t.coin.startsWith('@'));
 
@@ -345,8 +395,10 @@ server.tool(
     const questionMap = new Map<number, QuestionRaw>();
     for (const q of meta.questions) questionMap.set(q.question, q);
 
+    const outcomeToQuestion = buildOutcomeToQuestionMap(meta.questions);
+
     const summary = meta.outcomes.map(o => {
-      const question = [...questionMap.values()].find(q => q.namedOutcomes.includes(o.outcome));
+      const question = outcomeToQuestion.get(o.outcome);
       const sides = o.sideSpecs.map((s, i) => {
         const coin = outcomeToCoin(o.outcome, i);
         const mid = mids[coin];
