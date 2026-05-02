@@ -14,6 +14,12 @@
   <a href="https://x.com/LiquidictionHL">Twitter</a>
 </p>
 
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/Liquidiction/liquidiction-mcp">
+    <img src="https://glama.ai/mcp/servers/Liquidiction/liquidiction-mcp/badges/score.svg" alt="Liquidiction/liquidiction-mcp MCP server" />
+  </a>
+</p>
+
 ---
 
 ## What is this?
