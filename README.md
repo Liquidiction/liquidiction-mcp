@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://testnet.liquidiction.xyz/logo.png" alt="Liquidiction" width="80" />
+  <img src="https://liquidiction.xyz/logo.png" alt="Liquidiction" width="80" />
 </p>
 
 <h1 align="center">Liquidiction MCP Server</h1>
@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://testnet.liquidiction.xyz">App</a> |
-  <a href="https://liquidiction.xyz">Website</a> |
+  <a href="https://liquidiction.xyz">App</a> |
+  <a href="https://liquidiction.gitbook.io/liquidiction-docs">Docs</a> |
   <a href="https://x.com/LiquidictionHL">Twitter</a>
 </p>
 
@@ -78,9 +78,9 @@ npm start
 
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
-| `HL_API_URL` | `https://api.hyperliquid-testnet.xyz` | Hyperliquid API endpoint |
+| `HL_API_URL` | `https://api.hyperliquid.xyz` | Hyperliquid API endpoint |
 
-Set to `https://api.hyperliquid.xyz` for mainnet data.
+Mainnet is the default. Set `HL_API_URL=https://api.hyperliquid-testnet.xyz` only when you explicitly want testnet data.
 
 ## Example Queries
 
@@ -108,7 +108,7 @@ Uses `get_candles` with 1h interval to show price movement over time.
 
 HIP-4 (Hyperliquid Improvement Proposal 4) introduces prediction markets that run natively on Hyperliquid's L1 order book engine. Key features:
 
-- Binary outcomes (Yes/No) priced 0-100 cents
+- Binary and multi-outcome markets with shares priced between $0 and $1
 - Fully collateralized (no leverage, no liquidation risk)
 - Shares the same infrastructure as perps and spot
 - Supports recurring markets (15M, 1H, 1D periods)
@@ -119,15 +119,15 @@ HIP-4 (Hyperliquid Improvement Proposal 4) introduces prediction markets that ru
 For enriched data with orderbook depth, volume, and metadata:
 
 ```
-GET https://testnet.liquidiction.xyz/api/premium/analytics
+GET https://liquidiction.xyz/api/premium/analytics
 ```
 
 Paywalled at $0.001/request via x402 USDC micropayments on Base Sepolia.
 
 ## Links
 
-- **App**: [testnet.liquidiction.xyz](https://testnet.liquidiction.xyz)
-- **Landing**: [liquidiction.xyz](https://liquidiction.xyz)
+- **App**: [liquidiction.xyz](https://liquidiction.xyz)
+- **Docs**: [liquidiction.gitbook.io/liquidiction-docs](https://liquidiction.gitbook.io/liquidiction-docs)
 - **Twitter**: [@LiquidictionHL](https://x.com/LiquidictionHL)
 - **Telegram**: [t.me/Liquidiction](https://t.me/Liquidiction)
 - **Built on**: [Hyperliquid](https://hyperliquid.xyz)
