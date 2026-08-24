@@ -12,7 +12,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-const API_URL = process.env.HL_API_URL ?? 'https://api.hyperliquid-testnet.xyz';
+const API_URL = process.env.HL_API_URL ?? 'https://api.hyperliquid.xyz';
 
 // ---------------------------------------------------------------------------
 // HL API helpers
@@ -64,9 +64,11 @@ function outcomeToCoin(outcomeId: number, side: number): string {
   return `#${10 * outcomeId + side}`;
 }
 
-function coinToAtFormat(coin: string): string {
-  const num = coin.startsWith('#') ? coin.slice(1) : coin;
-  return `@${num}`;
+function normalizeOutcomeCoin(coin: string): string {
+  const value = coin.trim();
+  if (value.startsWith('#')) return value;
+  if (value.startsWith('@')) return `#${value.slice(1)}`;
+  return `#${value}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +295,7 @@ server.tool(
 
     const candles = await hlInfo<Candle[]>({
       type: 'candleSnapshot',
-      req: { coin: coinToAtFormat(coin), interval, startTime, endTime },
+      req: { coin: normalizeOutcomeCoin(coin), interval, startTime, endTime },
     });
 
     const lines = candles.map(c => {
@@ -313,10 +315,10 @@ server.tool(
   async ({ coin }) => {
     const trades = await hlInfo<RecentTrade[]>({
       type: 'recentTrades',
-      coin: coinToAtFormat(coin),
+      coin: normalizeOutcomeCoin(coin),
     });
 
-    const outcomeTrades = trades.filter(t => t.coin.startsWith('@'));
+    const outcomeTrades = trades.filter(t => t.coin.startsWith('#'));
 
     if (outcomeTrades.length === 0) {
       return { content: [{ type: 'text', text: 'No recent trades found.' }] };
