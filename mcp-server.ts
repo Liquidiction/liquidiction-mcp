@@ -11,8 +11,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { pathToFileURL } from 'node:url';
+import {
+  buildPositions, marketContext, markPrice, normalizeOutcomeCoin, outcomeToCoin, requestOutcomeCoin,
+  type Balance, type OutcomeMeta, type OutcomeRaw, type QuestionRaw,
+} from './outcomes.js';
 
-const API_URL = process.env.HL_API_URL ?? 'https://api.hyperliquid-testnet.xyz';
+export const API_URL = process.env.HL_API_URL ?? 'https://api.hyperliquid.xyz';
 
 // ---------------------------------------------------------------------------
 // HL API helpers
@@ -23,26 +28,12 @@ async function hlInfo<T>(body: object): Promise<T> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`HL API error: ${res.status}`);
   return res.json() as Promise<T>;
 }
 
-interface OutcomeRaw {
-  outcome: number;
-  name: string;
-  description: string;
-  sideSpecs: { name: string }[];
-}
-interface QuestionRaw {
-  question: number;
-  name: string;
-  description: string;
-  fallbackOutcome: number;
-  namedOutcomes: number[];
-  settledNamedOutcomes: number[];
-}
-interface OutcomeMeta { outcomes: OutcomeRaw[]; questions: QuestionRaw[] }
 interface L2Level { px: string; sz: string; n: number }
 interface L2Book { coin: string; levels: [L2Level[], L2Level[]] }
 interface UserFill {
@@ -60,22 +51,18 @@ interface RecentTrade {
   coin: string; side: string; px: string; sz: string; time: number; hash: string; tid: number;
 }
 
-function outcomeToCoin(outcomeId: number, side: number): string {
-  return `#${10 * outcomeId + side}`;
-}
-
-function coinToAtFormat(coin: string): string {
-  const num = coin.startsWith('#') ? coin.slice(1) : coin;
-  return `@${num}`;
-}
+const addressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'Expected a wallet address');
+const outcomeIdSchema = z.number().int().nonnegative().max(Math.floor((Number.MAX_SAFE_INTEGER - 1) / 10));
+const coinSchema = z.string().refine(coin => normalizeOutcomeCoin(coin, true) !== null, 'Invalid outcome coin');
 
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
+export function createServer(info: typeof hlInfo = hlInfo) {
 const server = new McpServer({
   name: 'liquidiction',
-  version: '1.0.0',
+  version: '1.0.1',
 });
 
 // --- list_markets ---
@@ -85,8 +72,8 @@ server.tool(
   {},
   async () => {
     const [meta, mids] = await Promise.all([
-      hlInfo<OutcomeMeta>({ type: 'outcomeMeta' }),
-      hlInfo<Record<string, string>>({ type: 'allMids' }),
+      info<OutcomeMeta>({ type: 'outcomeMeta' }),
+      info<Record<string, string>>({ type: 'allMids' }),
     ]);
 
     const questionMap = new Map<number, QuestionRaw>();
@@ -112,10 +99,11 @@ server.tool(
       for (const o of outcomes) {
         const sides = o.sideSpecs.map((s, i) => {
           const coin = outcomeToCoin(o.outcome, i);
-          const mid = mids[coin] ? (parseFloat(mids[coin]) * 100).toFixed(1) + '%' : '?';
-          return `${s.name}: ${mid}`;
+          const price = markPrice(mids, coin);
+          const mid = price === null ? '?' : `${(price * 100).toFixed(1)}%`;
+          return `${marketContext(meta, o.outcome, i).selection ?? s.name}: ${mid}`;
         });
-        const label = q ? `  [${o.outcome}] ${o.name}` : `\n[${o.outcome}] ${o.name}`;
+        const label = `[${o.outcome}] ${marketContext(meta, o.outcome, 0).market} (${o.venue ?? 'unknown venue'})`;
         lines.push(`${label} — ${sides.join(' | ')}`);
       }
     }
@@ -128,10 +116,11 @@ server.tool(
 server.tool(
   'get_orderbook',
   'Get order book for a specific outcome side',
-  { outcome_id: z.number().describe('Outcome ID'), side: z.number().min(0).max(1).default(0).describe('Side (0=Yes/first, 1=No/second)') },
+  { outcome_id: outcomeIdSchema.describe('Outcome ID'), side: z.number().int().min(0).max(1).default(0).describe('Side (0=Yes/first, 1=No/second)') },
   async ({ outcome_id, side }) => {
     const coin = outcomeToCoin(outcome_id, side);
-    const book = await hlInfo<L2Book>({ type: 'l2Book', coin });
+    const book = await info<L2Book | null>({ type: 'l2Book', coin });
+    if (!book) return { content: [{ type: 'text', text: `No order book available for ${coin}.` }] };
 
     const bids = book.levels[0].slice(0, 10);
     const asks = book.levels[1].slice(0, 10);
@@ -161,11 +150,14 @@ server.tool(
   'Get current mid prices for all outcome coins',
   {},
   async () => {
-    const mids = await hlInfo<Record<string, string>>({ type: 'allMids' });
-    const outcomeMids = Object.entries(mids)
-      .filter(([coin]) => coin.startsWith('#'))
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([coin, px]) => `${coin}: ${(parseFloat(px) * 100).toFixed(2)}%`)
+    const mids = await info<Record<string, string>>({ type: 'allMids' });
+    const coins = [...new Set(Object.keys(mids).map(coin => normalizeOutcomeCoin(coin)).filter((coin): coin is string => coin !== null))];
+    const outcomeMids = coins
+      .sort()
+      .map(coin => {
+        const price = markPrice(mids, coin);
+        return `${coin}: ${price === null ? 'unavailable' : `${(price * 100).toFixed(2)}%`}`;
+      })
       .join('\n');
 
     return { content: [{ type: 'text', text: outcomeMids || 'No outcome prices found' }] };
@@ -176,10 +168,10 @@ server.tool(
 server.tool(
   'get_user_fills',
   'Get trade history for a user address',
-  { address: z.string().describe('User wallet address'), limit: z.number().default(20).describe('Max number of fills to return') },
+  { address: addressSchema.describe('User wallet address'), limit: z.number().int().min(1).max(2000).default(20).describe('Max number of fills to return') },
   async ({ address, limit }) => {
-    const fills = await hlInfo<UserFill[]>({ type: 'userFills', user: address });
-    const outcomeFills = fills.filter(f => f.coin.startsWith('#')).slice(0, limit);
+    const fills = await info<UserFill[]>({ type: 'userFills', user: address });
+    const outcomeFills = fills.filter(f => normalizeOutcomeCoin(f.coin) !== null).slice(0, limit);
 
     if (outcomeFills.length === 0) {
       return { content: [{ type: 'text', text: 'No outcome trades found for this address.' }] };
@@ -200,10 +192,10 @@ server.tool(
 server.tool(
   'get_open_orders',
   'Get open orders for a user address',
-  { address: z.string().describe('User wallet address') },
+  { address: addressSchema.describe('User wallet address') },
   async ({ address }) => {
-    const orders = await hlInfo<OpenOrder[]>({ type: 'openOrders', user: address });
-    const outcomeOrders = orders.filter(o => o.coin.startsWith('#'));
+    const orders = await info<OpenOrder[]>({ type: 'openOrders', user: address });
+    const outcomeOrders = orders.filter(o => normalizeOutcomeCoin(o.coin) !== null);
 
     if (outcomeOrders.length === 0) {
       return { content: [{ type: 'text', text: 'No open outcome orders.' }] };
@@ -220,28 +212,22 @@ server.tool(
 // --- get_user_positions ---
 server.tool(
   'get_user_positions',
-  'Get current outcome share positions for a user',
-  { address: z.string().describe('User wallet address') },
+  'Get current outcome balances with venue, participant, held shares and mark values. Does not discover wallets or merge contracts across deployers.',
+  { address: addressSchema.describe('User wallet address') },
   async ({ address }) => {
-    const [spotState, mids] = await Promise.all([
-      hlInfo<{ balances: { coin: string; total: string }[] }>({ type: 'spotClearinghouseState', user: address }),
-      hlInfo<Record<string, string>>({ type: 'allMids' }),
+    const [spotState, mids, meta] = await Promise.all([
+      info<{ balances: Balance[] }>({ type: 'spotClearinghouseState', user: address }),
+      info<Record<string, string>>({ type: 'allMids' }),
+      info<OutcomeMeta>({ type: 'outcomeMeta' }),
     ]);
 
-    const positions = spotState.balances
-      .filter(b => b.coin.startsWith('#') && parseFloat(b.total) !== 0)
-      .map(b => {
-        const shares = parseFloat(b.total);
-        const price = mids[b.coin] ? parseFloat(mids[b.coin]) : 0;
-        const value = shares * price;
-        return `${b.coin}: ${shares.toFixed(0)} shares @ ${(price * 100).toFixed(1)}% = $${value.toFixed(2)}`;
-      });
-
-    if (positions.length === 0) {
-      return { content: [{ type: 'text', text: 'No outcome positions.' }] };
-    }
-
-    return { content: [{ type: 'text', text: positions.join('\n') }] };
+    const result = {
+      address, fetchedAt: new Date().toISOString(),
+      source: 'Hyperliquid public info API',
+      note: 'Snapshot reads are not atomic. Unheld shares are total minus hold, not an execution guarantee. Markets on different venues retain their own settlement rules. Missing marks or metadata remain null.',
+      positions: buildPositions(spotState.balances, mids, meta),
+    };
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   },
 );
 
@@ -249,11 +235,11 @@ server.tool(
 server.tool(
   'get_market_detail',
   'Get detailed info about a specific market outcome',
-  { outcome_id: z.number().describe('Outcome ID') },
+  { outcome_id: outcomeIdSchema.describe('Outcome ID') },
   async ({ outcome_id }) => {
     const [meta, mids] = await Promise.all([
-      hlInfo<OutcomeMeta>({ type: 'outcomeMeta' }),
-      hlInfo<Record<string, string>>({ type: 'allMids' }),
+      info<OutcomeMeta>({ type: 'outcomeMeta' }),
+      info<Record<string, string>>({ type: 'allMids' }),
     ]);
 
     const outcome = meta.outcomes.find(o => o.outcome === outcome_id);
@@ -267,11 +253,13 @@ server.tool(
     if (question) lines.push(`Question: ${question.name}`);
     lines.push(`Outcome: ${outcome.name}`);
     lines.push(`Description: ${outcome.description}`);
+    lines.push(`Venue: ${outcome.venue ?? 'unknown'}`);
     lines.push(`Sides:`);
     for (let i = 0; i < outcome.sideSpecs.length; i++) {
       const coin = outcomeToCoin(outcome_id, i);
-      const mid = mids[coin] ? (parseFloat(mids[coin]) * 100).toFixed(2) + '%' : 'N/A';
-      lines.push(`  ${outcome.sideSpecs[i].name}: ${mid} (${coin})`);
+      const price = markPrice(mids, coin);
+      const mid = price === null ? 'N/A' : `${(price * 100).toFixed(2)}%`;
+      lines.push(`  ${marketContext(meta, outcome_id, i).selection ?? outcome.sideSpecs[i].name}: ${mid} (${coin})`);
     }
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -283,20 +271,20 @@ server.tool(
   'get_candles',
   'Get OHLCV candle data for a prediction market outcome',
   {
-    coin: z.string().describe('Coin identifier, e.g. "#90"'),
-    interval: z.string().default('1h').describe('Candle interval: "1m", "5m", "15m", "1h", "4h", "1d"'),
-    hours: z.number().default(24).describe('Hours of history to fetch'),
+    coin: coinSchema.describe('Outcome coin: #N, +N, legacy @N, or numeric'),
+    interval: z.enum(['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '8h', '12h', '1d', '3d', '1w', '1M']).default('1h'),
+    hours: z.number().positive().max(8760).default(24).describe('Hours of history to fetch'),
   },
   async ({ coin, interval, hours }) => {
     const endTime = Date.now();
     const startTime = endTime - hours * 60 * 60 * 1000;
 
-    const candles = await hlInfo<Candle[]>({
+    const candles = await info<Candle[] | null>({
       type: 'candleSnapshot',
-      req: { coin: coinToAtFormat(coin), interval, startTime, endTime },
+      req: { coin: requestOutcomeCoin(coin), interval, startTime, endTime },
     });
 
-    const lines = candles.map(c => {
+    const lines = (candles ?? []).map(c => {
       const time = new Date(c.t).toISOString().slice(0, 16);
       return `${time}  O:${(parseFloat(c.o) * 100).toFixed(1)}% H:${(parseFloat(c.h) * 100).toFixed(1)}% L:${(parseFloat(c.l) * 100).toFixed(1)}% C:${(parseFloat(c.c) * 100).toFixed(1)}% V:${c.v} (${c.n} trades)`;
     });
@@ -309,14 +297,14 @@ server.tool(
 server.tool(
   'get_recent_trades',
   'Get recent trades for a prediction market outcome',
-  { coin: z.string().describe('Coin identifier, e.g. "#90"') },
+  { coin: coinSchema.describe('Outcome coin: #N, +N, legacy @N, or numeric') },
   async ({ coin }) => {
-    const trades = await hlInfo<RecentTrade[]>({
+    const trades = await info<RecentTrade[] | null>({
       type: 'recentTrades',
-      coin: coinToAtFormat(coin),
+      coin: requestOutcomeCoin(coin),
     });
 
-    const outcomeTrades = trades.filter(t => t.coin.startsWith('@'));
+    const outcomeTrades = (trades ?? []).filter(t => normalizeOutcomeCoin(t.coin) === requestOutcomeCoin(coin));
 
     if (outcomeTrades.length === 0) {
       return { content: [{ type: 'text', text: 'No recent trades found.' }] };
@@ -338,8 +326,8 @@ server.tool(
   {},
   async () => {
     const [meta, mids] = await Promise.all([
-      hlInfo<OutcomeMeta>({ type: 'outcomeMeta' }),
-      hlInfo<Record<string, string>>({ type: 'allMids' }),
+      info<OutcomeMeta>({ type: 'outcomeMeta' }),
+      info<Record<string, string>>({ type: 'allMids' }),
     ]);
 
     const questionMap = new Map<number, QuestionRaw>();
@@ -349,11 +337,11 @@ server.tool(
       const question = [...questionMap.values()].find(q => q.namedOutcomes.includes(o.outcome));
       const sides = o.sideSpecs.map((s, i) => {
         const coin = outcomeToCoin(o.outcome, i);
-        const mid = mids[coin];
+        const mid = markPrice(mids, coin);
         return {
-          label: s.name,
+          label: marketContext(meta, o.outcome, i).selection ?? s.name,
           coin,
-          probability: mid ? `${(parseFloat(mid) * 100).toFixed(1)}%` : null,
+          probability: mid === null ? null : `${(mid * 100).toFixed(1)}%`,
         };
       });
 
@@ -370,6 +358,8 @@ server.tool(
 
       return {
         id: o.outcome,
+        venue: o.venue ?? null,
+        market: marketContext(meta, o.outcome, 0).market,
         name: o.name,
         question: question?.name ?? null,
         sides,
@@ -385,9 +375,14 @@ server.tool(
   },
 );
 
-// Start
+return server;
+}
+
+// Importing the factory for offline tests must not start a stdio server.
 async function main() {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
 }
-main().catch(console.error);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => { console.error(error); process.exitCode = 1; });
+}
